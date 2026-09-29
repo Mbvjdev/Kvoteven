@@ -1,0 +1,33 @@
+# Builds and local verification can contain private paths or account data.
+.build*/
+build/
+dist/
+verification/
+.DS_Store
+*.log
+__pycache__/
+*.py[cod]
+.swiftpm/
+
+# Credentials and personal runtime state never belong in this repo.
+.env
+.env.*
+!.env.example
+.hermes/
+.codex/
+auth.json
+credentials.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keychain*
+*.sqlite*
+*.db
+*.dSYM/
+
+# Editor / tool state
+.idea/
+.vscode/
+.venv/

@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    name: Test and build (macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test models, translations, and read-only bridge
+        run: |
+          swift test
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Audit published files
+        run: python3 scripts/check_public_tree.py
+      - name: Scan Git history for secrets
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          brew install gitleaks
+          gitleaks git --redact --no-banner .
+      - name: Build and verify the native app
+        run: python3 scripts/build_app.py
+      - name: Verify both languages and appearances without accounts
+        run: python3 scripts/check_demo.py

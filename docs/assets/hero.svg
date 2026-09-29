@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="380" viewBox="0 0 1100 380" role="img" aria-labelledby="title desc">
+  <title id="title">Kvoteven — Your AI budget has a pet now.</title>
+  <desc id="desc">An original green pixel pet beside the Kvoteven name. A native macOS menu-bar companion for Codex quota and DeepSeek balance.</desc>
+  <rect width="1100" height="380" rx="24" fill="#f3f7f1"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" fill="#273b30">
+    <text x="54" y="74" font-size="27" font-weight="650">Kvoteven</text>
+    <text x="52" y="151" font-size="51" font-weight="700">Your AI budget</text>
+    <text x="52" y="211" font-size="51" font-weight="700">has a pet now.</text>
+    <text x="54" y="263" font-size="20" fill="#56695d">Codex quota. DeepSeek balance. Right in your menu bar.</text>
+    <text x="54" y="322" font-size="16" fill="#46644c">Native macOS · Open source · English / Dansk</text>
+  </g>
+  <ellipse cx="899" cy="316" rx="90" ry="9" fill="#dce8d8"/>
+  <g transform="translate(756 34) scale(11)" shape-rendering="crispEdges">
+    <g fill="#30473b">
+      <path d="M5 3h3v6H5zM16 3h3v6h-3zM6 6h12v3H6zM4 8h16v12H4zM3 10h18v8H3zM6 19h12v3H6zM6 21h4v2H6zM14 21h4v2h-4zM20 15h3v4h-3z"/>
+    </g>
+    <g fill="#9bd4a6">
+      <path d="M6 5h1v4H6zM17 5h1v4h-1zM7 7h10v3H7zM5 9h14v10H5zM4 11h16v6H4zM7 19h10v2H7zM20 15h1v3h-1z"/>
+    </g>
+    <path d="M7 9h5v1H7z" fill="#d4ecda"/>
+    <path d="M6 16h2v1H6zM16 16h2v1h-2z" fill="#e69c8f"/>
+    <path d="M8 12h2v3H8zM14 12h2v3h-2zM10 16h1v1h-1zM13 16h1v1h-1zM11 17h2v1h-2z" fill="#30473b"/>
+  </g>
+</svg>

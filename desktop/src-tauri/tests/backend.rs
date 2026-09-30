@@ -16,6 +16,8 @@ use kvoteven_lib::models::APP_VERSION;
 use kvoteven_lib::providers::{
     codex_protocol, parse_codex_rate_limits, read_codex_quota, read_hermes_quota,
 };
+#[cfg(windows)]
+use kvoteven_lib::runner::SpawnedProcess;
 use kvoteven_lib::runner::{run_bounded, Executable, RunError, SpawnOptions};
 
 /// Compile `tests/support/probe.rs` once with `rustc` and reuse the binary.
@@ -168,6 +170,104 @@ async fn runner_process_group_kill_reaches_descendants() {
     assert!(
         dead,
         "grandchild {pid} must be reaped with the process group"
+    );
+}
+
+/// True when a Windows pid is still alive. Uses `OpenProcess` +
+/// `GetExitCodeProcess` (`STILL_ACTIVE`) so the test stays dependency-free.
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let mut code = 0u32;
+                let alive =
+                    GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+                let _ = CloseHandle(handle);
+                alive
+            }
+            // ERROR_INVALID_PARAMETER: no such process.
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_pidfile(path: &std::path::Path) {
+    for _ in 0..40 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("grandchild never wrote its pidfile");
+}
+
+/// The probe's `tree` mode spawns a grandchild as its very first action — the
+/// same "launcher spawns interpreter immediately" shape that would otherwise
+/// race the job assignment. The grandchild must die with the Job Object even
+/// though only the direct child was killed by name.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_job_object_kills_descendants_on_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let opts = SpawnOptions {
+        timeout: Duration::from_secs(2),
+        max_output_bytes: 1024 * 1024,
+    };
+    let r = run_bounded(&probe(), &args(&["tree", pidfile.to_str().unwrap()]), &opts).await;
+    assert!(matches!(r, Err(RunError::TimedOut)));
+
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut dead = false;
+    for _ in 0..40 {
+        if !pid_alive(pid) {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(dead, "grandchild {pid} must die with the Job Object");
+}
+
+/// Dropping the `SpawnedProcess` (success/error/cancellation path) must close
+/// the kill-on-close Job Object and reap the grandchild, not just the direct
+/// child.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_job_object_kills_descendants_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let child =
+        SpawnedProcess::spawn(&probe(), &args(&["tree", pidfile.to_str().unwrap()])).unwrap();
+    wait_for_pidfile(&pidfile);
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    drop(child);
+
+    let mut dead = false;
+    for _ in 0..40 {
+        if !pid_alive(pid) {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        dead,
+        "grandchild {pid} must die when the SpawnedProcess is dropped"
     );
 }
 

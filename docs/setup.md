@@ -83,6 +83,38 @@ Choose a read-only source in Settings (**Auto / Codex CLI / Hermes**):
 *Auto* prefers the Codex CLI when present, then Hermes, and does not silently switch after
 an error. Missing weekly data means the weekly meter cannot be shown; Kvoteven will not guess.
 
+### How Kvoteven finds the `codex` binary
+
+Kvoteven only ever runs the **native** Codex vendor binary — it never spawns a shell or a
+`.cmd`/`.bat` shim, and it never reads your Codex login. It looks for the binary in a fixed,
+bounded order:
+
+1. `KVOTEVEN_CODEX`, when set to the **absolute path of a native `codex` executable** (below).
+2. The native vendor binary shipped by the `@openai/codex-<platform>` npm package, under
+   these `node_modules` roots:
+   - `./node_modules` and every ancestor's `node_modules` (a local
+     `npm install @openai/codex`);
+   - `/opt/homebrew/lib/node_modules` and `/usr/local/lib/node_modules`
+     (Homebrew / npm global);
+   - `~/.npm-global/lib/node_modules`;
+   - `%APPDATA%\npm\node_modules` (Windows npm global).
+   Both the hoisted `@openai/codex-<platform>` package and the nested
+   `@openai/codex/node_modules/@openai/codex-<platform>` layout are searched.
+3. A `codex` executable in these fixed directories (resolving any npm `bin/codex`
+   symlink back to its `node_modules` root to reach the vendor binary):
+   `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.npm-global/bin`, and
+   `%APPDATA%\npm` on Windows.
+4. The ambient `PATH`, with the same symlink resolution.
+
+Only the locations above are searched. Kvoteven does **not** scan your home directory
+recursively, and it does **not** search version-manager `node_modules` locations
+(e.g. nvm, Volta or fnm). If your install lives somewhere else, set `KVOTEVEN_CODEX`.
+
+To point Kvoteven at a specific binary, launch with `KVOTEVEN_CODEX` set to the **absolute
+path of a native `codex` executable** — not a `.cmd`/`.bat` shim and not the `bin/codex.js`
+wrapper. This is a trust decision: Kvoteven runs that exact file with your permissions, so
+use only a path you trust.
+
 ## App controls
 
 Open the panel to switch provider, language or Codex source, refresh, toggle demo, or quit.

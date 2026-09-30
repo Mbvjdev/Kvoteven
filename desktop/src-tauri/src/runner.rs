@@ -5,9 +5,11 @@
 //!
 //! On Unix the child is placed in its own process group and killing it kills
 //! the whole group (best-effort: a descendant that calls `setsid`/daemonizes
-//! is outside the group and is *not* guaranteed to be reaped). On Windows only
-//! the native binary is ever spawned (shell `.cmd`/`.bat` shims are rejected at
-//! discovery time), so there is no wrapper parent chain to orphan.
+//! is outside the group and is *not* guaranteed to be reaped). On Windows the
+//! child is assigned to a kill-on-close Job Object *before it runs* (see the
+//! `runner_windows` module), so a wrapper chain such as a pip launcher
+//! (`hermes.exe` → `python.exe`) is reaped as a unit even on timeout, error or
+//! cancellation — no wrapper chain is left orphaned.
 
 use std::fmt;
 use std::io;
@@ -17,6 +19,9 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+
+#[cfg(windows)]
+mod runner_windows;
 
 /// A resolved native executable path. Never a shell script or `.cmd`/`.bat`
 /// shim: those wrappers are rejected during discovery so we only ever spawn the
@@ -85,38 +90,57 @@ pub struct SpawnedProcess {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<tokio::process::ChildStdout>,
+    /// On Windows: the kill-on-close Job Object owning this child and every
+    /// process it spawns. Dropping or terminating it kills the whole tree.
+    #[cfg(windows)]
+    job: Option<runner_windows::JobHandle>,
 }
 
 /// Kill the direct child and, on Unix, its whole process group. `start_kill`
 /// is always issued so the direct child is guaranteed to die even if the group
 /// kill is a no-op (e.g. the child failed to become a group leader).
+#[cfg(unix)]
 fn kill_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // `process_group(0)` made the child its own group leader, so its
-            // pgid equals its pid and a negative-pid kill reaches descendants.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+    if let Some(pid) = child.id() {
+        // `process_group(0)` made the child its own group leader, so its
+        // pgid equals its pid and a negative-pid kill reaches descendants.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
         }
+    }
+    let _ = child.start_kill();
+}
+
+/// Terminate the Job Object (killing the child and every descendant) and then
+/// the direct child as a backstop for the degraded no-job path.
+#[cfg(windows)]
+fn kill_tree(child: &mut Child, job: &mut Option<runner_windows::JobHandle>) {
+    if let Some(job) = job.take() {
+        job.terminate();
     }
     let _ = child.start_kill();
 }
 
 impl SpawnedProcess {
     pub fn spawn(exec: &Executable, args: &[String]) -> io::Result<Self> {
-        let mut cmd = exec.to_command();
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+        // Windows assigns the child to a kill-on-close job *before* resuming it
+        // (see `runner_windows::spawn_suspended`); Unix puts it in its own
+        // process group.
+        #[cfg(windows)]
+        let (mut child, job) = runner_windows::spawn_suspended(exec, args)?;
+
         #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-        let mut child = cmd.spawn()?;
+        let mut child = {
+            let mut cmd = exec.to_command();
+            cmd.args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0);
+            cmd.spawn()?
+        };
+
         let stdin = child.stdin.take();
         let stdout = child
             .stdout
@@ -126,6 +150,8 @@ impl SpawnedProcess {
             child: Some(child),
             stdin,
             stdout: BufReader::new(stdout),
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -187,13 +213,18 @@ impl SpawnedProcess {
         }
     }
 
-    /// Terminate the child (and its process group on Unix) if still running,
-    /// then reap it. Always safe to call.
+    /// Terminate the child (and its process group on Unix / Job Object on
+    /// Windows) if still running, then reap it. Always safe to call.
     pub async fn reap(&mut self) {
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
                 Ok(Some(_)) => {}
-                _ => kill_tree(&mut child),
+                _ => {
+                    #[cfg(unix)]
+                    kill_tree(&mut child);
+                    #[cfg(windows)]
+                    kill_tree(&mut child, &mut self.job);
+                }
             }
             let _ = child.wait().await;
         }
@@ -212,7 +243,10 @@ impl Drop for SpawnedProcess {
     fn drop(&mut self) {
         // Guaranteed reap even on panic / early return / cancellation.
         if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
             kill_tree(&mut child);
+            #[cfg(windows)]
+            kill_tree(&mut child, &mut self.job);
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     let _ = child.wait().await;
@@ -221,6 +255,8 @@ impl Drop for SpawnedProcess {
             // Outside a runtime the kill signal has still been sent; the OS
             // reaps it.
         }
+        // On Windows the Job Object (if any) is dropped here too, so
+        // kill-on-close reaps any descendant that outlived the direct child.
     }
 }
 

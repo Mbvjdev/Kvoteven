@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Only local Kvoteven IPC; no shell, filesystem, HTTP or opener plugin.",
+  "windows": [
+    "main"
+  ],
+  "permissions": []
+}

@@ -27,6 +27,14 @@ credentials.json
 *.db
 *.dSYM/
 
+# Cross-platform toolchains and generated outputs
+node_modules/
+target/
+desktop/src-tauri/gen/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
 # Editor / tool state
 .idea/
 .vscode/

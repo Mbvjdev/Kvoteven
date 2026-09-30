@@ -7,7 +7,18 @@ from pathlib import Path, PurePosixPath
 
 def inspect_payload(path, data):
     p = PurePosixPath(path)
-    allowed_roots = {"Sources", "Tests", "scripts", "docs", ".github"}
+    allowed_roots = {"Sources", "Tests", "scripts", "docs", ".github", "desktop"}
+    generated = {"node_modules", "target", "dist", "build", "verification", "test-results", "playwright-report", "gen"}
+    if any(part in generated for part in p.parts):
+        return ["generated or private runtime artifact"]
+    approved_images = {
+        "docs/assets/hero.svg", "docs/assets/overview.png", "docs/assets/desktop-overview.png",
+        "desktop/src-tauri/icons/32x32.png", "desktop/src-tauri/icons/128x128.png",
+        "desktop/src-tauri/icons/128x128@2x.png", "desktop/src-tauri/icons/icon.icns",
+        "desktop/src-tauri/icons/icon.ico",
+    }
+    if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".icns", ".ico", ".svg"} and path not in approved_images:
+        return ["image has not been explicitly reviewed for publication"]
     allowed_files = {"Package.swift", "README.md", "README.da.md", "LICENSE",
                      "SECURITY.md", "CONTRIBUTING.md", "CHANGELOG.md", ".gitignore", ".gitattributes"}
     if p.parts[0] not in allowed_roots and path not in allowed_files:
@@ -20,7 +31,7 @@ def inspect_payload(path, data):
     patterns = {
         "possible API credential": rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})",
         "private key material": rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-        "personal absolute path": rb"/(?:Users|home)/[A-Za-z0-9_.-]+/",
+        "personal absolute path": rb"(?:/(?:Users|home)/[A-Za-z0-9_.-]+/|[A-Za-z]:[\\/]Users[\\/][A-Za-z0-9_. -]+[\\/])",
     }
     return [label for label, pattern in patterns.items() if re.search(pattern, data)]
 

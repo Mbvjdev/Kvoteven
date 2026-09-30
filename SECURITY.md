@@ -45,6 +45,12 @@ requests, credit purchases or automatic top-ups. It does not reset or bypass usa
   It runs with your user permissions, so only run packages you can verify and subprocesses
   (Codex CLI / Hermes) you trust.
 - `KVOTEVEN_HERMES` selects a local Hermes executable, not a remote URL. It is a trust decision.
+- `KVOTEVEN_CODEX` selects a local **native** Codex executable by absolute path, never a
+  remote URL or a shell shim. It is a trust decision: Kvoteven runs that exact file with
+  your permissions. Codex discovery otherwise searches only the fixed install locations
+  documented in [setup](docs/setup.md) plus the `PATH`; it never runs a shell or a
+  `.cmd`/`.bat` shim, never reads Codex auth, and never does an arbitrary recursive scan
+  of your home directory.
 - Demo mode is explicit and never a fallback for failed live authentication.
 
 ## What must never be published

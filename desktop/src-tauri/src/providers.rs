@@ -582,27 +582,63 @@ pub fn parse_hermes_quota(body: &[u8]) -> Result<PercentQuota, AppError> {
 /// invoking them leaves a parent chain that a plain `kill` cannot reap. We
 /// therefore prefer the native vendor binary directly.
 pub fn discover_codex() -> Option<Executable> {
-    // 1. Explicit native-binary override (used by the CLI check path).
+    // 1. Explicit absolute native override (see docs/setup.md and SECURITY.md).
     if let Ok(env) = std::env::var("KVOTEVEN_CODEX") {
         let p = PathBuf::from(&env);
         if p.is_absolute() && is_executable(&p) {
             return Some(Executable::Direct(p));
         }
     }
-    // 2. Native vendor binary from a local npm install (walk node_modules).
-    for root in node_modules_roots() {
-        if let Some(exe) = find_codex_vendor_binary(&root) {
+    discover_codex_with(
+        &codex_node_modules_roots(),
+        &codex_bin_dirs(),
+        &path_entries(),
+    )
+}
+
+/// Deterministic, bounded Codex discovery over explicit lists. Pure with
+/// respect to cwd/PATH: it only reads what its callers pass in, so the
+/// platform-specific root/bin layout can be exercised from tests on any host.
+fn discover_codex_with(
+    node_modules_roots: &[PathBuf],
+    bin_dirs: &[PathBuf],
+    path_dirs: &[PathBuf],
+) -> Option<Executable> {
+    // Native vendor binary first, under the deterministic node_modules roots.
+    for root in node_modules_roots {
+        if let Some(exe) = find_codex_vendor_binary(root) {
             return Some(exe);
         }
     }
-    // 3. PATH fallback; on Windows reject shell shims (.cmd/.bat).
-    which_executable("codex")
+    // Then fixed bin directories (Homebrew, ~/.local, npm-global). A
+    // Finder/GUI-launched process has a minimal PATH, so these must not rely
+    // on the ambient shell PATH.
+    for dir in bin_dirs {
+        if let Some(exe) = resolve_codex_native(&dir.join(exe_name("codex"))) {
+            return Some(exe);
+        }
+    }
+    // Finally the ambient PATH, with the same symlink resolution.
+    for dir in path_dirs {
+        if let Some(exe) = resolve_codex_native(&dir.join(exe_name("codex"))) {
+            return Some(exe);
+        }
+    }
+    None
 }
 
-/// Return the `node_modules` roots to search for the Codex vendor binary: the
-/// current directory and its ancestors (the same resolution node uses), so a
-/// local `npm install @openai/codex` is found regardless of where the app runs.
-fn node_modules_roots() -> Vec<PathBuf> {
+/// All deterministic `node_modules` roots to search, in priority order: the
+/// current directory and its ancestors (the same resolution node uses, so a
+/// local `npm install @openai/codex` is always found), then the fixed global
+/// install locations. Bounded and explicit — never a recursive home scan.
+fn codex_node_modules_roots() -> Vec<PathBuf> {
+    let mut roots = cwd_ancestor_node_modules();
+    roots.extend(fixed_node_modules_roots());
+    dedup_paths(roots)
+}
+
+/// The `node_modules` roots from the current directory and its ancestors.
+fn cwd_ancestor_node_modules() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut dir = std::env::current_dir().ok();
     while let Some(d) = dir {
@@ -610,6 +646,100 @@ fn node_modules_roots() -> Vec<PathBuf> {
         dir = d.parent().map(Path::to_path_buf);
     }
     roots
+}
+
+/// Fixed global `node_modules` roots for common installations, in priority
+/// order: Homebrew (Apple Silicon and Intel), the npm default global prefix,
+/// user-level `~/.npm-global`, and on Windows `%APPDATA%\npm`. Explicit and
+/// bounded — an arbitrary deep home tree is never traversed.
+fn fixed_node_modules_roots() -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/opt/homebrew/lib/node_modules"),
+        PathBuf::from("/usr/local/lib/node_modules"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".npm-global/lib/node_modules"));
+    }
+    #[cfg(windows)]
+    {
+        // npm's global prefix on Windows is %APPDATA%\npm.
+        if let Some(appdata) = dirs::config_dir() {
+            roots.push(appdata.join("npm").join("node_modules"));
+        }
+    }
+    roots
+}
+
+/// Fixed bin directories searched before the ambient PATH: Homebrew,
+/// `~/.local/bin` and `~/.npm-global/bin`, plus `%APPDATA%\npm` on Windows.
+/// Entries are resolved through symlinks to their node_modules roots.
+fn codex_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = dirs::config_dir() {
+            dirs.push(appdata.join("npm"));
+        }
+    }
+    dirs
+}
+
+/// The ambient `PATH`, split per the platform separator. An empty or unset
+/// `PATH` yields no entries (never an error).
+fn path_entries() -> Vec<PathBuf> {
+    match std::env::var_os("PATH") {
+        Some(path) => std::env::split_paths(&path).collect(),
+        None => Vec::new(),
+    }
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
+/// Follow a candidate `codex` path through symlinks to its final target and
+/// prefer the native vendor binary when that target lives under a
+/// `node_modules` tree (the npm `bin/codex` shim is a symlink into the
+/// package); otherwise return the resolved native executable. Only regular
+/// files passing `is_executable` are ever returned, so a `.cmd`/`.bat` shim
+/// (or a nonexistent path) is never produced.
+fn resolve_codex_native(path: &Path) -> Option<Executable> {
+    let resolved = std::fs::canonicalize(path)
+        .ok()
+        .unwrap_or_else(|| path.to_path_buf());
+    if !is_executable(&resolved) {
+        return None;
+    }
+    if let Some(root) = node_modules_root_of(&resolved) {
+        if let Some(exe) = find_codex_vendor_binary(&root) {
+            return Some(exe);
+        }
+    }
+    Some(Executable::Direct(resolved))
+}
+
+/// The nearest ancestor directory named `node_modules`, or `None`. Walks only
+/// ancestors, so it is bounded by path depth.
+fn node_modules_root_of(path: &Path) -> Option<PathBuf> {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// Map the current platform to the `@openai/codex-<platform>` npm package
@@ -627,12 +757,27 @@ fn codex_platform_pkg() -> Option<&'static str> {
 }
 
 /// Search a single `node_modules` root for the native Codex vendor binary,
-/// tolerating any `vendor/<triple>` naming the package chose.
+/// tolerating any `vendor/<triple>` naming the package chose and both the
+/// hoisted and nested optional-package layouts.
 fn find_codex_vendor_binary(node_modules: &Path) -> Option<Executable> {
     let pkg = codex_platform_pkg()?;
-    let vendor = node_modules
-        .join(format!("@openai/codex-{pkg}"))
-        .join("vendor");
+    // Hoisted: node_modules/@openai/codex-<pkg>/vendor/...
+    let hoisted = node_modules.join(format!("@openai/codex-{pkg}"));
+    if let Some(exe) = vendor_binary_in(&hoisted) {
+        return Some(exe);
+    }
+    // Nested: node_modules/@openai/codex/node_modules/@openai/codex-<pkg>/...
+    // (npm does not always hoist the optional platform package).
+    let nested = node_modules
+        .join("@openai/codex")
+        .join("node_modules")
+        .join(format!("@openai/codex-{pkg}"));
+    vendor_binary_in(&nested)
+}
+
+/// Search one platform-package directory for `vendor/<triple>/bin/codex[.exe]`.
+fn vendor_binary_in(pkg_dir: &Path) -> Option<Executable> {
+    let vendor = pkg_dir.join("vendor");
     let entries = std::fs::read_dir(&vendor).ok()?;
     for entry in entries.flatten() {
         let bin = entry.path().join("bin").join(exe_name("codex"));
@@ -1020,5 +1165,198 @@ mod tests {
         assert!(!is_executable(Path::new("/definitely/not/here")));
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_executable(&dir.path().join("subdir")));
+    }
+
+    /// Mark a synthetic fixture executable on Unix; on Windows the `.exe`
+    /// extension check in `is_executable` is sufficient, so this is a no-op.
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
+    /// Write a hoisted vendor binary fixture and return its path.
+    fn write_vendor_fixture(node_modules: &Path, pkg: &str) -> PathBuf {
+        let bin = node_modules
+            .join(format!("@openai/codex-{pkg}"))
+            .join("vendor")
+            .join("some-triple")
+            .join("bin")
+            .join(exe_name("codex"));
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        make_executable(&bin);
+        bin
+    }
+
+    #[test]
+    fn find_codex_vendor_binary_discovers_nested_optional_package() {
+        let Some(pkg) = codex_platform_pkg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        // node_modules/@openai/codex/node_modules/@openai/codex-<pkg>/vendor/...
+        let nested_bin = nm
+            .join("@openai/codex")
+            .join("node_modules")
+            .join(format!("@openai/codex-{pkg}"))
+            .join("vendor")
+            .join("some-triple")
+            .join("bin")
+            .join(exe_name("codex"));
+        std::fs::create_dir_all(nested_bin.parent().unwrap()).unwrap();
+        std::fs::write(&nested_bin, b"").unwrap();
+        make_executable(&nested_bin);
+
+        let found = find_codex_vendor_binary(&nm);
+        assert!(
+            found.is_some(),
+            "nested optional package must be discovered"
+        );
+        match found.unwrap() {
+            Executable::Direct(p) => assert_eq!(p, nested_bin),
+        }
+    }
+
+    #[test]
+    fn discover_with_finds_hoisted_vendor_in_fixed_global_root_without_path() {
+        let Some(pkg) = codex_platform_pkg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate /usr/local/lib/node_modules (a fixed global root) holding the
+        // hoisted optional package. No cwd-ancestor roots, no bin dirs, no PATH:
+        // discovery must still find the vendor binary.
+        let nm = dir.path().join("node_modules");
+        let bin = write_vendor_fixture(&nm, pkg);
+
+        let found = discover_codex_with(&[nm], &[], &[]);
+        assert!(
+            found.is_some(),
+            "fixed global vendor binary must be discovered"
+        );
+        match found.unwrap() {
+            Executable::Direct(p) => assert_eq!(p, bin),
+        }
+    }
+
+    #[test]
+    fn discover_with_finds_nested_windows_appdata_layout_without_path() {
+        let Some(pkg) = codex_platform_pkg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // %APPDATA%\npm\node_modules\@openai\codex\node_modules\@openai\codex-<pkg>
+        // \vendor\triple\bin\codex[.exe] — the nested optional-package layout npm
+        // produces when it does not hoist. Exercised on any host via explicit roots.
+        let nm = dir.path().join("npm").join("node_modules");
+        let bin = nm
+            .join("@openai/codex")
+            .join("node_modules")
+            .join(format!("@openai/codex-{pkg}"))
+            .join("vendor")
+            .join("some-triple")
+            .join("bin")
+            .join(exe_name("codex"));
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        make_executable(&bin);
+
+        let found = discover_codex_with(&[nm], &[], &[]);
+        assert!(
+            found.is_some(),
+            "nested Windows layout vendor binary must be discovered"
+        );
+        match found.unwrap() {
+            Executable::Direct(p) => assert_eq!(p, bin),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_with_resolves_bin_shim_symlink_to_nested_vendor() {
+        let Some(pkg) = codex_platform_pkg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // npm layout: <root>/bin/codex -> ../lib/node_modules/@openai/codex/bin/codex.js
+        // with the vendor binary nested under @openai/codex/node_modules.
+        let nm = dir.path().join("lib").join("node_modules");
+        let wrapper = nm.join("@openai/codex").join("bin").join("codex.js");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, b"#!/usr/bin/env node\n").unwrap();
+        make_executable(&wrapper);
+
+        let vendor = nm
+            .join("@openai/codex")
+            .join("node_modules")
+            .join(format!("@openai/codex-{pkg}"))
+            .join("vendor")
+            .join("some-triple")
+            .join("bin")
+            .join(exe_name("codex"));
+        std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+        std::fs::write(&vendor, b"").unwrap();
+        make_executable(&vendor);
+
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(&wrapper, bin_dir.join("codex")).unwrap();
+
+        // No node_modules roots, no PATH: only the bin dir. Discovery must
+        // resolve the shim symlink back to its node_modules root and prefer the
+        // native vendor binary over the node wrapper.
+        let found = discover_codex_with(&[], &[bin_dir], &[]);
+        assert!(
+            found.is_some(),
+            "shim symlink must resolve to the vendor binary"
+        );
+        match found.unwrap() {
+            Executable::Direct(p) => assert_eq!(
+                std::fs::canonicalize(&p).unwrap(),
+                std::fs::canonicalize(&vendor).unwrap()
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_with_resolves_plain_symlink_to_native_without_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-codex");
+        std::fs::write(&real, b"").unwrap();
+        make_executable(&real);
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(&real, bin_dir.join("codex")).unwrap();
+
+        let found = discover_codex_with(&[], &[bin_dir], &[]);
+        assert!(
+            found.is_some(),
+            "plain symlinked native binary must be discovered"
+        );
+        match found.unwrap() {
+            Executable::Direct(p) => assert_eq!(
+                std::fs::canonicalize(&p).unwrap(),
+                std::fs::canonicalize(&real).unwrap()
+            ),
+        }
+    }
+
+    #[test]
+    fn node_modules_root_of_walks_only_ancestors() {
+        assert_eq!(
+            node_modules_root_of(Path::new("/a/node_modules/@openai/codex/bin/codex.js")),
+            Some(PathBuf::from("/a/node_modules"))
+        );
+        // A path outside any node_modules tree yields None.
+        assert_eq!(node_modules_root_of(Path::new("/a/b/c/codex")), None);
     }
 }

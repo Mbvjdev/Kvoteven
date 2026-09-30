@@ -64,6 +64,12 @@ The app can be built from source with locked dependency versions in
 `desktop/package-lock.json` and `desktop/src-tauri/Cargo.lock`. Byte-for-byte
 reproducibility of signed installers has not been established.
 
+The manifest binds the download's SHA-256 to its native test report and records the
+clean source checkout's commit. This is **not** independent proof that arbitrary package
+bytes were built from that commit. Build provenance comes from the linked CI run's
+checkout → locked build → installed-package test → upload sequence; local builds must
+record and preserve the same source-to-build relationship.
+
 ## Production release requirements
 
 A package may only be called production-ready after all of the following, none of which can

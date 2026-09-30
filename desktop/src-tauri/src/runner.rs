@@ -14,6 +14,7 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
 #[cfg(windows)]
+#[path = "runner_windows.rs"]
 mod runner_windows;
 
 /// A resolved native executable path. Never a shell script or `.cmd`/`.bat`

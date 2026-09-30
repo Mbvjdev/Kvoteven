@@ -179,14 +179,17 @@ fn codex_app_server(scenario: &str, expected_version: &str, log: Option<&str>) {
 
     if !init_ok || scenario == "init-error" {
         // Fail the handshake: the client must see an error and abort before
-        // sending `initialized` / `account/rateLimits/read`.
+        // sending `initialized` / `account/rateLimits/read`. Log readiness
+        // *before* exposing the error on stdout — the client kills the probe
+        // the moment it sees the error, so a post-send marker may never be
+        // written.
+        log_line(log, "init_error_prepared=true");
         let _ = writeln!(
             out,
             "{}",
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied"}}"#
         );
         let _ = out.flush();
-        log_line(log, "init_error_sent=true");
         // The client must not send anything further; exit so any further write
         // would fail.
         return;

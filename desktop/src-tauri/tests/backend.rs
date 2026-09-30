@@ -328,7 +328,7 @@ async fn codex_init_error_aborts_before_further_messages() {
     ];
     let result = codex_protocol(&probe(), &a, Duration::from_secs(10)).await;
     assert!(matches!(result, Err(RunError::Io(_))));
-    assert!(codex_log_contains(&log, "init_error_sent=true"));
+    assert!(codex_log_contains(&log, "init_error_prepared=true"));
 }
 
 #[tokio::test]

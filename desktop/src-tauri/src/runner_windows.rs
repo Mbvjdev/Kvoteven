@@ -15,10 +15,16 @@
 //! escape the job. We therefore spawn with `CREATE_SUSPENDED`, assign the
 //! suspended process handle, and only then resume the primary thread. std /
 //! tokio close the primary thread handle immediately after `CreateProcessW`
-//! and never expose it, so we recover the *single* thread of a just-created
-//! suspended process through a bounded Toolhelp thread snapshot (a suspended
-//! process has exactly one thread, so this is a fixed-size enumeration of that
-//! process's threads, not a system-wide process scan).
+//! and never expose it, so we recover the thread of the just-created suspended
+//! process from a Toolhelp thread snapshot.
+//!
+//! `TH32CS_SNAPTHREAD` always includes *every* thread in the system and its
+//! `th32ProcessID` argument is ignored for this flag, so the snapshot is a
+//! single, finite snapshot of the system-wide thread list — not a fixed-size,
+//! per-process enumeration. We walk it once and keep only the entry whose
+//! `th32OwnerProcessID` matches the suspended child; a just-created suspended
+//! process has exactly one thread, so the first matching entry is its primary
+//! thread. There is no recursive re-snapshotting or rescanning.
 
 use std::ffi::c_void;
 use std::io;
@@ -103,16 +109,21 @@ impl Drop for JobHandle {
 }
 
 /// Resume the primary thread of `pid`, which must have been spawned with
-/// `CREATE_SUSPENDED`. A just-created suspended process has exactly one thread,
-/// so the Toolhelp snapshot below is a bounded, single-process enumeration.
+/// `CREATE_SUSPENDED`. The thread is located from a single finite Toolhelp
+/// thread snapshot: `TH32CS_SNAPTHREAD` always contains all system threads
+/// (`th32ProcessID` is ignored for this flag), so entries are filtered by
+/// owner PID. A just-created suspended process has exactly one thread, so the
+/// first matching entry is its primary thread.
 fn resume_primary_thread(pid: u32) -> io::Result<()> {
     // SAFETY: all handles are closed exactly once; the snapshot entry is
     // re-initialised by `Thread32First`/`Thread32Next` per the Toolhelp
     // contract.
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::other)?;
-        let mut entry = THREADENTRY32::default();
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
         let mut thread_id = None;
         if Thread32First(snapshot, &mut entry).is_ok() {
             loop {
@@ -143,14 +154,29 @@ fn resume_primary_thread(pid: u32) -> io::Result<()> {
 }
 
 /// Spawn `exec args` suspended, assign it to a fresh kill-on-close job, then
-/// resume it. Returns the running child and the owning job (if assignment
-/// succeeded). On assignment failure we degrade to direct-child-only cleanup
-/// (`None` job) rather than failing the spawn: the child still runs and is
-/// still killed directly, it just lacks descendant cleanup.
+/// resume it. Returns the running child and its owning job.
+///
+/// Fails closed: if the child cannot be assigned to the job (or its primary
+/// thread cannot be resumed), the still-suspended child is killed and a
+/// sanitized I/O error is returned — the helper is never allowed to run
+/// outside the job.
 pub(crate) fn spawn_suspended(
     exec: &Executable,
     args: &[String],
 ) -> io::Result<(Child, Option<JobHandle>)> {
+    spawn_suspended_with_assign(exec, args, |job, process| job.assign(process))
+}
+
+/// The assignment step is injected so a regression test can simulate a failed
+/// assignment; production always uses `JobHandle::assign`.
+fn spawn_suspended_with_assign<F>(
+    exec: &Executable,
+    args: &[String],
+    assign: F,
+) -> io::Result<(Child, Option<JobHandle>)>
+where
+    F: FnOnce(&JobHandle, HANDLE) -> io::Result<()>,
+{
     let job = JobHandle::new()?;
 
     let mut cmd = exec.to_command();
@@ -163,33 +189,70 @@ pub(crate) fn spawn_suspended(
 
     let mut child = cmd.spawn()?;
 
-    let Some(raw) = child.raw_handle() else {
-        // The child exited before we could assign it; nothing left to clean up.
-        return Ok((child, None));
-    };
-    let Some(pid) = child.id() else {
-        return Ok((child, None));
-    };
-
     // Assign *before* the child executes so any descendant it spawns is born
-    // into the job and dies with it.
-    let assigned = job.assign(HANDLE(raw));
+    // into the job and dies with it. Any failure before assign + resume both
+    // succeed must fail closed: the child is still suspended, so kill it (never
+    // resume it) and surface a sanitized error rather than letting it run
+    // outside the job.
+    let outcome: io::Result<()> = (|| {
+        let raw = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("spawned child has no raw process handle"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned child has no process id"))?;
+        assign(&job, HANDLE(raw))?;
+        resume_primary_thread(pid)
+    })();
 
-    // Always resume: a suspended child would otherwise leak forever. If the
-    // resume itself fails, reap what we can and surface the error.
-    if let Err(e) = resume_primary_thread(pid) {
-        if assigned.is_ok() {
-            job.terminate();
-        }
+    if let Err(e) = outcome {
+        // Fail closed. `terminate` reaps the job if assignment succeeded but
+        // resume failed, and is a no-op if assignment itself failed; the direct
+        // child is then killed (and reaped on drop via `kill_on_drop`) so it can
+        // never execute the helper.
+        job.terminate();
         let _ = child.start_kill();
         return Err(e);
     }
 
-    if assigned.is_err() {
-        // Child is already in some other job (e.g. inherited from our own
-        // process) and could not be moved. Direct-child kill still applies.
-        return Ok((child, None));
-    }
-
     Ok((child, Some(job)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Regression: an assignment failure must fail closed — the helper must
+    /// never run — instead of resuming the child and returning `Ok` with no job
+    /// (which would let it execute outside any kill-on-close job).
+    #[tokio::test]
+    async fn assignment_failure_fails_closed_and_never_runs_helper() {
+        let marker = std::env::temp_dir().join(format!(
+            "kvoteven_assignment_failure_{}.tmp",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let exec = Executable::Direct(PathBuf::from("cmd.exe"));
+        let args = vec![
+            "/C".to_string(),
+            format!("type nul > \"{}\"", marker.display()),
+        ];
+
+        let result = spawn_suspended_with_assign(&exec, &args, |_job, _process| {
+            Err(io::Error::other("simulated assignment failure"))
+        });
+
+        match result {
+            Ok(_) => panic!("assignment failure must fail closed, not return Ok"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::Other),
+        }
+
+        assert!(
+            !marker.exists(),
+            "helper executed despite failed assignment; marker file was created"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
 }
